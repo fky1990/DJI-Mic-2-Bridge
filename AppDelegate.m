@@ -29,6 +29,7 @@ static OSStatus KeepAliveIOProc(AudioObjectID inDevice,
 @property(nonatomic, strong) NSStatusItem *statusItem;
 @property(nonatomic, strong) NSMenu *menu;
 @property(nonatomic, strong) NSMenuItem *statusMenuItem;
+@property(nonatomic, strong) NSMenuItem *batteryMenuItem;
 @property(nonatomic, strong) IOBluetoothDevice *mic;
 @property(nonatomic, strong) IOBluetoothHandsFreeAudioGateway *gateway;
 @property(nonatomic, strong) NSTimer *timer;
@@ -36,6 +37,12 @@ static OSStatus KeepAliveIOProc(AudioObjectID inDevice,
 @property(nonatomic, copy) NSString *lowLatencyError;
 @property(nonatomic, assign) BOOL permissionRequestInFlight;
 @property(nonatomic, copy) AudioObjectPropertyListenerBlock outputDeviceListener;
+@property(nonatomic, assign) NSInteger batteryPercent;
+@property(nonatomic, strong) NSDate *lastBatteryPollDate;
+@property(nonatomic, strong) NSDate *batteryBaselineDate;
+@property(nonatomic, assign) NSInteger batteryBaselinePercent;
+@property(nonatomic, assign) double measuredDrainPercentPerHour;
+@property(nonatomic, assign) NSInteger batteryObservationCount;
 @end
 
 static NSString *AudioDeviceName(AudioObjectID deviceID) {
@@ -149,6 +156,16 @@ static UInt32 AudioDeviceTransportType(AudioObjectID deviceID) {
     return transport;
 }
 
+static NSInteger DJIBatteryPercent(IOBluetoothDevice *device) {
+    if (!device || !device.isConnected) return NSNotFound;
+    SEL selector = NSSelectorFromString(@"batteryPercentSingle");
+    if (![device respondsToSelector:selector]) return NSNotFound;
+    typedef unsigned char (*BatteryPercentFunction)(id, SEL);
+    BatteryPercentFunction function = (BatteryPercentFunction)[device methodForSelector:selector];
+    unsigned char value = function(device, selector);
+    return value <= 100 ? value : NSNotFound;
+}
+
 static AudioObjectID FindInputDevice(NSString *wantedName) {
     AudioObjectPropertyAddress address = {
         kAudioHardwarePropertyDevices,
@@ -182,6 +199,9 @@ static AudioObjectID FindInputDevice(NSString *wantedName) {
 
 static NSString * const PreferredOutputUIDKey = @"PreferredOutputDeviceUID";
 static NSString * const PreferredSystemOutputUIDKey = @"PreferredSystemOutputDeviceUID";
+static NSString * const MeasuredBatteryDrainKey = @"MeasuredBatteryDrainPercentPerHour";
+static NSString * const BatteryObservationCountKey = @"BatteryObservationCount";
+static const double NominalBatteryHours = 6.0;
 
 - (NSImage *)statusImageConnected:(BOOL)connected {
     NSImage *image = [[NSImage alloc] initWithSize:NSMakeSize(24, 18)];
@@ -208,6 +228,9 @@ static NSString * const PreferredSystemOutputUIDKey = @"PreferredSystemOutputDev
     self.statusMenuItem = [[NSMenuItem alloc] initWithTitle:@"正在检查…" action:nil keyEquivalent:@""];
     self.statusMenuItem.enabled = NO;
     [self.menu addItem:self.statusMenuItem];
+    self.batteryMenuItem = [[NSMenuItem alloc] initWithTitle:@"电量：等待连接" action:nil keyEquivalent:@""];
+    self.batteryMenuItem.enabled = NO;
+    [self.menu addItem:self.batteryMenuItem];
     [self.menu addItem:NSMenuItem.separatorItem];
     [self.menu addItem:[[NSMenuItem alloc] initWithTitle:@"连接 / 重连 DJI Mic 2" action:@selector(connectMic:) keyEquivalent:@"r"]];
     [self.menu addItem:[[NSMenuItem alloc] initWithTitle:@"设为系统默认输入" action:@selector(makeDefaultInput:) keyEquivalent:@"d"]];
@@ -219,11 +242,105 @@ static NSString * const PreferredSystemOutputUIDKey = @"PreferredSystemOutputDev
     self.statusItem.menu = self.menu;
 
     self.mic = [self findPairedMic];
+    self.batteryPercent = NSNotFound;
+    self.measuredDrainPercentPerHour = [NSUserDefaults.standardUserDefaults doubleForKey:MeasuredBatteryDrainKey];
+    self.batteryObservationCount = [NSUserDefaults.standardUserDefaults integerForKey:BatteryObservationCountKey];
     [self rememberCurrentOutputsIfSafe];
     [self installOutputDeviceListeners];
     self.timer = [NSTimer scheduledTimerWithTimeInterval:1.0 target:self selector:@selector(refreshStatus:) userInfo:nil repeats:YES];
     [self refreshStatus:nil];
     [self performSelector:@selector(connectMic:) withObject:nil afterDelay:0.5];
+}
+
+- (void)resetBatterySession {
+    self.batteryPercent = NSNotFound;
+    self.lastBatteryPollDate = nil;
+    self.batteryBaselineDate = nil;
+    self.batteryBaselinePercent = NSNotFound;
+}
+
+- (void)updateBatteryReading {
+    NSDate *now = NSDate.date;
+    if (self.lastBatteryPollDate &&
+        [now timeIntervalSinceDate:self.lastBatteryPollDate] < 30.0) return;
+    self.lastBatteryPollDate = now;
+
+    NSInteger newPercent = DJIBatteryPercent(self.mic);
+    if (newPercent == NSNotFound) return;
+
+    if (!self.batteryBaselineDate || self.batteryBaselinePercent == NSNotFound || newPercent > self.batteryPercent) {
+        self.batteryBaselineDate = now;
+        self.batteryBaselinePercent = newPercent;
+    } else {
+        NSInteger drop = self.batteryBaselinePercent - newPercent;
+        NSTimeInterval elapsed = [now timeIntervalSinceDate:self.batteryBaselineDate];
+        if (drop >= 1 && (elapsed >= 1800.0 || drop >= 2)) {
+            double observedRate = drop / (elapsed / 3600.0);
+            if (observedRate >= 1.0 && observedRate <= 100.0) {
+                if (self.measuredDrainPercentPerHour > 0) {
+                    self.measuredDrainPercentPerHour =
+                        self.measuredDrainPercentPerHour * 0.7 + observedRate * 0.3;
+                } else {
+                    self.measuredDrainPercentPerHour = observedRate;
+                }
+                self.batteryObservationCount += 1;
+                [NSUserDefaults.standardUserDefaults setDouble:self.measuredDrainPercentPerHour
+                                                        forKey:MeasuredBatteryDrainKey];
+                [NSUserDefaults.standardUserDefaults setInteger:self.batteryObservationCount
+                                                         forKey:BatteryObservationCountKey];
+            }
+            self.batteryBaselineDate = now;
+            self.batteryBaselinePercent = newPercent;
+        }
+    }
+    self.batteryPercent = newPercent;
+}
+
+- (double)estimatedRemainingHours {
+    if (self.batteryPercent == NSNotFound) return -1;
+    double nominalRate = 100.0 / NominalBatteryHours;
+    double rate = nominalRate;
+    if (self.measuredDrainPercentPerHour > 0 && self.batteryObservationCount > 0) {
+        double measuredWeight = MIN(0.8, 0.25 * self.batteryObservationCount);
+        rate = nominalRate * (1.0 - measuredWeight) +
+               self.measuredDrainPercentPerHour * measuredWeight;
+    }
+    return MIN(12.0, MAX(0.0, self.batteryPercent / rate));
+}
+
+- (NSString *)remainingTimeText {
+    double hours = [self estimatedRemainingHours];
+    if (hours < 0) return @"预计时间未知";
+    NSInteger minutes = (NSInteger)llround(hours * 60.0 / 5.0) * 5;
+    if (minutes <= 5) return @"预计不足5分钟";
+    if (minutes < 60) return [NSString stringWithFormat:@"预计约%ld分钟", (long)minutes];
+    NSInteger wholeHours = minutes / 60;
+    NSInteger remainingMinutes = minutes % 60;
+    if (remainingMinutes == 0) return [NSString stringWithFormat:@"预计约%ld小时", (long)wholeHours];
+    return [NSString stringWithFormat:@"预计约%ld小时%ld分",
+            (long)wholeHours, (long)remainingMinutes];
+}
+
+- (void)updateBatteryDisplayConnected:(BOOL)connected {
+    if (!connected) {
+        self.statusItem.button.title = @"";
+        self.batteryMenuItem.title = @"电量：未连接";
+        return;
+    }
+    [self updateBatteryReading];
+    if (self.batteryPercent == NSNotFound) {
+        self.statusItem.button.title = @"";
+        self.batteryMenuItem.title = @"电量：暂时无法读取";
+        return;
+    }
+    NSString *timeText = [self remainingTimeText];
+    self.statusItem.button.title =
+        [NSString stringWithFormat:@" %ld%%（≈%@）",
+         (long)self.batteryPercent,
+         [[timeText stringByReplacingOccurrencesOfString:@"预计约" withString:@""]
+             stringByReplacingOccurrencesOfString:@"预计" withString:@""]];
+    self.batteryMenuItem.title =
+        [NSString stringWithFormat:@"电量：%ld%%（%@）", (long)self.batteryPercent, timeText];
 }
 
 - (IOBluetoothDevice *)findPairedMic {
@@ -376,6 +493,8 @@ static NSString * const PreferredSystemOutputUIDKey = @"PreferredSystemOutputDev
     [self stopLowLatencyKeepAlive];
     [self.gateway disconnect];
     self.gateway = nil;
+    [self resetBatterySession];
+    [self updateBatteryDisplayConnected:NO];
     [self refreshStatus:nil];
 }
 
@@ -467,6 +586,7 @@ static NSString * const PreferredSystemOutputUIDKey = @"PreferredSystemOutputDev
     if (ready) {
         [self restoreOutputsIfDJI];
         [self ensureLowLatencyKeepAlive:deviceID];
+        [self updateBatteryDisplayConnected:YES];
         BOOL isDefault = [self isDefaultInput:deviceID];
         if (_keepAliveRunning) {
             self.statusMenuItem.title = isDefault ? @"已连接 · 低延迟 · 默认输入" : @"已连接 · 低延迟模式";
@@ -480,6 +600,8 @@ static NSString * const PreferredSystemOutputUIDKey = @"PreferredSystemOutputDev
     } else {
         self.statusMenuItem.title = self.lastError ?: (self.mic ? @"正在建立音频链路…" : @"等待配对 DJI Mic 2");
         [self stopLowLatencyKeepAlive];
+        [self resetBatterySession];
+        [self updateBatteryDisplayConnected:NO];
         self.statusItem.button.image = [self statusImageConnected:NO];
         self.statusItem.button.toolTip = @"DJI Mic 2 未连接";
     }
@@ -500,6 +622,7 @@ static NSString * const PreferredSystemOutputUIDKey = @"PreferredSystemOutputDev
 }
 
 - (void)handsFree:(IOBluetoothHandsFree *)device disconnected:(NSNumber *)status {
+    [self resetBatterySession];
     [self refreshStatus:nil];
 }
 

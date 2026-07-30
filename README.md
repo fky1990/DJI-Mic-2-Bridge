@@ -18,6 +18,7 @@ SCO 音频链路，不修改设备固件，也不安装内核或虚拟音频驱�
 - 可一键设为 macOS 默认输入。
 - 连接时保留当前默认扬声器，防止输出被切到没有扬声器的 DJI 发射器。
 - 菜单栏使用“麦克风 + D”图标，与系统麦克风图标区分。
+- 菜单栏显示发射器电量及预计剩余使用时间。
 - 低延迟保活：持续保持音频输入流，避免 SCO 休眠造成开口后数秒才有声音。
 - 不录音、不保存音频、不联网，也不收集遥测数据。
 
@@ -45,6 +46,12 @@ SCO 音频链路，不修改设备固件，也不安装内核或虚拟音频驱�
 
 低延迟模式会持续打开输入流，因此发射器会更接近连续传输状态，耗电高于待机。
 MacBook 端的额外功耗很低。退出 App 或选择“断开音频链路”会停止保活。
+
+预计剩余时间初始按约 6 小时满电续航计算，之后会根据本机实际掉电速度在本地
+逐步校准。估算数据只保存在 macOS 用户偏好中，不会上传。
+
+电量来自 macOS 已读取的蓝牙设备电池字段。由于 Apple 没有把该读取接口列入
+公开 SDK，未来 macOS 若移除该字段，App 会安全降级为“暂时无法读取”，不影响收音。
 
 如果音频已经能立即进入 Mac，但文字仍固定延迟数秒，延迟通常来自识别软件自身
 的语音分段或静音判断。
@@ -90,6 +97,7 @@ does not modify firmware or install a kernel/virtual-audio driver.
 - Exposes it as a Core Audio input and can make it the default input.
 - Preserves the current default speaker when macOS creates the DJI output endpoint.
 - Distinct “microphone + D” menu bar icon.
+- Transmitter battery percentage and estimated remaining runtime.
 - Low-latency keep-alive prevents the SCO link from sleeping between utterances.
 - No recording, saved audio, network access, analytics, or telemetry.
 

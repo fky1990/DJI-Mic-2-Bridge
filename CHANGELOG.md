@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.0] - 2026-07-30
+
+- Show DJI Mic 2 battery percentage in the menu bar and menu.
+- Estimate remaining runtime from a six-hour nominal baseline.
+- Calibrate the estimate over time using locally observed battery drain.
+
 ## [0.2.1] - 2026-07-30
 
 - Preserve the user's default output and system-output devices when connecting.
