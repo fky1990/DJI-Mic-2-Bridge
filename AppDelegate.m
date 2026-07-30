@@ -35,6 +35,7 @@ static OSStatus KeepAliveIOProc(AudioObjectID inDevice,
 @property(nonatomic, copy) NSString *lastError;
 @property(nonatomic, copy) NSString *lowLatencyError;
 @property(nonatomic, assign) BOOL permissionRequestInFlight;
+@property(nonatomic, copy) AudioObjectPropertyListenerBlock outputDeviceListener;
 @end
 
 static NSString *AudioDeviceName(AudioObjectID deviceID) {
@@ -58,6 +59,94 @@ static BOOL AudioDeviceHasInput(AudioObjectID deviceID) {
     UInt32 size = 0;
     if (AudioObjectGetPropertyDataSize(deviceID, &address, 0, NULL, &size) != noErr) return NO;
     return size >= sizeof(AudioStreamID);
+}
+
+static BOOL AudioDeviceHasOutput(AudioObjectID deviceID) {
+    AudioObjectPropertyAddress address = {
+        kAudioDevicePropertyStreams,
+        kAudioDevicePropertyScopeOutput,
+        kAudioObjectPropertyElementMain
+    };
+    UInt32 size = 0;
+    if (AudioObjectGetPropertyDataSize(deviceID, &address, 0, NULL, &size) != noErr) return NO;
+    return size >= sizeof(AudioStreamID);
+}
+
+static NSString *AudioDeviceUID(AudioObjectID deviceID) {
+    CFStringRef uid = NULL;
+    UInt32 size = sizeof(uid);
+    AudioObjectPropertyAddress address = {
+        kAudioDevicePropertyDeviceUID,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    if (AudioObjectGetPropertyData(deviceID, &address, 0, NULL, &size, &uid) != noErr || !uid) return nil;
+    return CFBridgingRelease(uid);
+}
+
+static AudioObjectID DefaultAudioDevice(AudioObjectPropertySelector selector) {
+    AudioObjectPropertyAddress address = {
+        selector,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    AudioObjectID deviceID = kAudioObjectUnknown;
+    UInt32 size = sizeof(deviceID);
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &address, 0, NULL, &size, &deviceID) != noErr) {
+        return kAudioObjectUnknown;
+    }
+    return deviceID;
+}
+
+static OSStatus SetDefaultAudioDevice(AudioObjectPropertySelector selector, AudioObjectID deviceID) {
+    AudioObjectPropertyAddress address = {
+        selector,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    UInt32 size = sizeof(deviceID);
+    return AudioObjectSetPropertyData(kAudioObjectSystemObject, &address, 0, NULL, size, &deviceID);
+}
+
+static AudioObjectID FindOutputDeviceByUID(NSString *wantedUID) {
+    if (!wantedUID.length) return kAudioObjectUnknown;
+    AudioObjectPropertyAddress address = {
+        kAudioHardwarePropertyDevices,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    UInt32 size = 0;
+    if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &address, 0, NULL, &size) != noErr) {
+        return kAudioObjectUnknown;
+    }
+    AudioObjectID *devices = malloc(size);
+    if (!devices) return kAudioObjectUnknown;
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &address, 0, NULL, &size, devices) != noErr) {
+        free(devices);
+        return kAudioObjectUnknown;
+    }
+    AudioObjectID match = kAudioObjectUnknown;
+    NSUInteger count = size / sizeof(AudioObjectID);
+    for (NSUInteger i = 0; i < count; i++) {
+        if (AudioDeviceHasOutput(devices[i]) && [AudioDeviceUID(devices[i]) isEqualToString:wantedUID]) {
+            match = devices[i];
+            break;
+        }
+    }
+    free(devices);
+    return match;
+}
+
+static UInt32 AudioDeviceTransportType(AudioObjectID deviceID) {
+    UInt32 transport = 0;
+    UInt32 size = sizeof(transport);
+    AudioObjectPropertyAddress address = {
+        kAudioDevicePropertyTransportType,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    AudioObjectGetPropertyData(deviceID, &address, 0, NULL, &size, &transport);
+    return transport;
 }
 
 static AudioObjectID FindInputDevice(NSString *wantedName) {
@@ -90,6 +179,9 @@ static AudioObjectID FindInputDevice(NSString *wantedName) {
 }
 
 @implementation AppDelegate
+
+static NSString * const PreferredOutputUIDKey = @"PreferredOutputDeviceUID";
+static NSString * const PreferredSystemOutputUIDKey = @"PreferredSystemOutputDeviceUID";
 
 - (NSImage *)statusImageConnected:(BOOL)connected {
     NSImage *image = [[NSImage alloc] initWithSize:NSMakeSize(24, 18)];
@@ -126,6 +218,9 @@ static AudioObjectID FindInputDevice(NSString *wantedName) {
     for (NSMenuItem *item in self.menu.itemArray) item.target = self;
     self.statusItem.menu = self.menu;
 
+    self.mic = [self findPairedMic];
+    [self rememberCurrentOutputsIfSafe];
+    [self installOutputDeviceListeners];
     self.timer = [NSTimer scheduledTimerWithTimeInterval:1.0 target:self selector:@selector(refreshStatus:) userInfo:nil repeats:YES];
     [self refreshStatus:nil];
     [self performSelector:@selector(connectMic:) withObject:nil afterDelay:0.5];
@@ -150,15 +245,131 @@ static AudioObjectID FindInputDevice(NSString *wantedName) {
     }
 
     if (FindInputDevice(self.mic.name) != kAudioObjectUnknown) {
+        [self restoreOutputsIfDJI];
         [self refreshStatus:nil];
         return;
     }
 
+    [self rememberCurrentOutputsIfSafe];
     [self.gateway disconnect];
     self.gateway = [[IOBluetoothHandsFreeAudioGateway alloc] initWithDevice:self.mic delegate:self];
     self.gateway.supportedFeatures = IOBluetoothHandsFreeAudioGatewayFeatureCodecNegotiation;
     [self.gateway connect];
     [self refreshStatus:nil];
+}
+
+- (BOOL)isDJIAudioDevice:(AudioObjectID)deviceID {
+    if (deviceID == kAudioObjectUnknown) return NO;
+    NSString *name = AudioDeviceName(deviceID).uppercaseString ?: @"";
+    NSString *pairedName = self.mic.name.uppercaseString;
+    if (pairedName.length && [name isEqualToString:pairedName]) return YES;
+    return [name containsString:@"DJI"] && [name containsString:@"MIC"];
+}
+
+- (AudioObjectID)fallbackOutputDevice {
+    AudioObjectPropertyAddress address = {
+        kAudioHardwarePropertyDevices,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    UInt32 size = 0;
+    if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &address, 0, NULL, &size) != noErr) {
+        return kAudioObjectUnknown;
+    }
+    AudioObjectID *devices = malloc(size);
+    if (!devices) return kAudioObjectUnknown;
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &address, 0, NULL, &size, devices) != noErr) {
+        free(devices);
+        return kAudioObjectUnknown;
+    }
+    AudioObjectID firstNonDJI = kAudioObjectUnknown;
+    AudioObjectID builtIn = kAudioObjectUnknown;
+    NSUInteger count = size / sizeof(AudioObjectID);
+    for (NSUInteger i = 0; i < count; i++) {
+        if (!AudioDeviceHasOutput(devices[i]) || [self isDJIAudioDevice:devices[i]]) continue;
+        if (firstNonDJI == kAudioObjectUnknown) firstNonDJI = devices[i];
+        if (AudioDeviceTransportType(devices[i]) == kAudioDeviceTransportTypeBuiltIn) {
+            builtIn = devices[i];
+            break;
+        }
+    }
+    free(devices);
+    return builtIn != kAudioObjectUnknown ? builtIn : firstNonDJI;
+}
+
+- (void)rememberDevice:(AudioObjectID)deviceID forKey:(NSString *)key {
+    if (deviceID == kAudioObjectUnknown || [self isDJIAudioDevice:deviceID] || !AudioDeviceHasOutput(deviceID)) return;
+    NSString *uid = AudioDeviceUID(deviceID);
+    if (uid.length) [NSUserDefaults.standardUserDefaults setObject:uid forKey:key];
+}
+
+- (void)rememberCurrentOutputsIfSafe {
+    [self rememberDevice:DefaultAudioDevice(kAudioHardwarePropertyDefaultOutputDevice)
+                  forKey:PreferredOutputUIDKey];
+    [self rememberDevice:DefaultAudioDevice(kAudioHardwarePropertyDefaultSystemOutputDevice)
+                  forKey:PreferredSystemOutputUIDKey];
+}
+
+- (void)restoreOutputSelector:(AudioObjectPropertySelector)selector preferenceKey:(NSString *)key {
+    AudioObjectID current = DefaultAudioDevice(selector);
+    if (current == kAudioObjectUnknown) return;
+    if (![self isDJIAudioDevice:current]) {
+        [self rememberDevice:current forKey:key];
+        return;
+    }
+
+    NSString *savedUID = [NSUserDefaults.standardUserDefaults stringForKey:key];
+    AudioObjectID target = FindOutputDeviceByUID(savedUID);
+    if (target == kAudioObjectUnknown || [self isDJIAudioDevice:target]) target = [self fallbackOutputDevice];
+    if (target != kAudioObjectUnknown && target != current) SetDefaultAudioDevice(selector, target);
+}
+
+- (void)restoreOutputsIfDJI {
+    [self restoreOutputSelector:kAudioHardwarePropertyDefaultOutputDevice
+                 preferenceKey:PreferredOutputUIDKey];
+    [self restoreOutputSelector:kAudioHardwarePropertyDefaultSystemOutputDevice
+                 preferenceKey:PreferredSystemOutputUIDKey];
+}
+
+- (void)installOutputDeviceListeners {
+    if (self.outputDeviceListener) return;
+    __weak typeof(self) weakSelf = self;
+    self.outputDeviceListener = ^(UInt32 numberAddresses, const AudioObjectPropertyAddress *addresses) {
+        [weakSelf restoreOutputsIfDJI];
+    };
+    AudioObjectPropertyAddress defaultOutputAddress = {
+        kAudioHardwarePropertyDefaultOutputDevice,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    AudioObjectPropertyAddress systemOutputAddress = {
+        kAudioHardwarePropertyDefaultSystemOutputDevice,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    AudioObjectAddPropertyListenerBlock(kAudioObjectSystemObject, &defaultOutputAddress,
+                                        dispatch_get_main_queue(), self.outputDeviceListener);
+    AudioObjectAddPropertyListenerBlock(kAudioObjectSystemObject, &systemOutputAddress,
+                                        dispatch_get_main_queue(), self.outputDeviceListener);
+}
+
+- (void)removeOutputDeviceListeners {
+    if (!self.outputDeviceListener) return;
+    AudioObjectPropertyAddress defaultOutputAddress = {
+        kAudioHardwarePropertyDefaultOutputDevice,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    AudioObjectPropertyAddress systemOutputAddress = {
+        kAudioHardwarePropertyDefaultSystemOutputDevice,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    AudioObjectRemovePropertyListenerBlock(kAudioObjectSystemObject, &defaultOutputAddress,
+                                           dispatch_get_main_queue(), self.outputDeviceListener);
+    AudioObjectRemovePropertyListenerBlock(kAudioObjectSystemObject, &systemOutputAddress,
+                                           dispatch_get_main_queue(), self.outputDeviceListener);
+    self.outputDeviceListener = nil;
 }
 
 - (void)disconnectMic:(id)sender {
@@ -254,6 +465,7 @@ static AudioObjectID FindInputDevice(NSString *wantedName) {
     AudioObjectID deviceID = self.mic ? FindInputDevice(self.mic.name) : kAudioObjectUnknown;
     BOOL ready = deviceID != kAudioObjectUnknown;
     if (ready) {
+        [self restoreOutputsIfDJI];
         [self ensureLowLatencyKeepAlive:deviceID];
         BOOL isDefault = [self isDefaultInput:deviceID];
         if (_keepAliveRunning) {
@@ -314,6 +526,7 @@ static AudioObjectID FindInputDevice(NSString *wantedName) {
 }
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
+    [self removeOutputDeviceListeners];
     [self stopLowLatencyKeepAlive];
     [self.gateway disconnect];
 }

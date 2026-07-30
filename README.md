@@ -16,6 +16,7 @@ SCO 音频链路，不修改设备固件，也不安装内核或虚拟音频驱�
 - 自动发现已配对并处于蓝灯模式的 DJI Mic 2 发射器。
 - 将发射器注册为 Core Audio 输入设备。
 - 可一键设为 macOS 默认输入。
+- 连接时保留当前默认扬声器，防止输出被切到没有扬声器的 DJI 发射器。
 - 菜单栏使用“麦克风 + D”图标，与系统麦克风图标区分。
 - 低延迟保活：持续保持音频输入流，避免 SCO 休眠造成开口后数秒才有声音。
 - 不录音、不保存音频、不联网，也不收集遥测数据。
@@ -87,6 +88,7 @@ does not modify firmware or install a kernel/virtual-audio driver.
 
 - Finds a paired DJI Mic 2 transmitter in Bluetooth mode.
 - Exposes it as a Core Audio input and can make it the default input.
+- Preserves the current default speaker when macOS creates the DJI output endpoint.
 - Distinct “microphone + D” menu bar icon.
 - Low-latency keep-alive prevents the SCO link from sleeping between utterances.
 - No recording, saved audio, network access, analytics, or telemetry.
