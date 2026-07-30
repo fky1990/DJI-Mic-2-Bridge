@@ -335,10 +335,7 @@ static const double NominalBatteryHours = 6.0;
     }
     NSString *timeText = [self remainingTimeText];
     self.statusItem.button.title =
-        [NSString stringWithFormat:@" %ld%%（≈%@）",
-         (long)self.batteryPercent,
-         [[timeText stringByReplacingOccurrencesOfString:@"预计约" withString:@""]
-             stringByReplacingOccurrencesOfString:@"预计" withString:@""]];
+        [NSString stringWithFormat:@" %ld%%", (long)self.batteryPercent];
     self.batteryMenuItem.title =
         [NSString stringWithFormat:@"电量：%ld%%（%@）", (long)self.batteryPercent, timeText];
 }
