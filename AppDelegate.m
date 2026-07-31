@@ -163,7 +163,10 @@ static NSInteger DJIBatteryPercent(IOBluetoothDevice *device) {
     typedef unsigned char (*BatteryPercentFunction)(id, SEL);
     BatteryPercentFunction function = (BatteryPercentFunction)[device methodForSelector:selector];
     unsigned char value = function(device, selector);
-    return value <= 100 ? value : NSNotFound;
+    // IOBluetooth briefly reports 0 while its private battery cache is not ready.
+    // A connected HFP device cannot remain usable at a real 0%, so treat it as
+    // unavailable and retry instead of showing a misleading empty battery.
+    return value > 0 && value <= 100 ? value : NSNotFound;
 }
 
 static AudioObjectID FindInputDevice(NSString *wantedName) {
@@ -261,12 +264,24 @@ static const double NominalBatteryHours = 6.0;
 
 - (void)updateBatteryReading {
     NSDate *now = NSDate.date;
+    NSTimeInterval pollInterval = self.batteryPercent == NSNotFound ? 5.0 : 30.0;
     if (self.lastBatteryPollDate &&
-        [now timeIntervalSinceDate:self.lastBatteryPollDate] < 30.0) return;
+        [now timeIntervalSinceDate:self.lastBatteryPollDate] < pollInterval) return;
     self.lastBatteryPollDate = now;
 
+    // Reacquire the device so the reading is not taken from a stale
+    // IOBluetoothDevice instance retained before the battery cache updated.
+    IOBluetoothDevice *freshMic = [self findPairedMic];
+    if (freshMic.isConnected) self.mic = freshMic;
     NSInteger newPercent = DJIBatteryPercent(self.mic);
-    if (newPercent == NSNotFound) return;
+    if (newPercent == NSNotFound) {
+        // When a previously valid reading temporarily disappears, keep it on
+        // screen but retry in five seconds rather than waiting a full cycle.
+        if (self.batteryPercent != NSNotFound) {
+            self.lastBatteryPollDate = [now dateByAddingTimeInterval:-25.0];
+        }
+        return;
+    }
 
     if (!self.batteryBaselineDate || self.batteryBaselinePercent == NSNotFound || newPercent > self.batteryPercent) {
         self.batteryBaselineDate = now;
